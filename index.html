@@ -102,6 +102,28 @@ b, strong { font-weight: 600; }
 .top-title { flex: 1; min-width: 0; font-weight: 600; font-size: 1.02rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .top-title .tt { display: inline-flex; align-items: center; gap: 6px; }
 .top-actions { display: flex; align-items: center; gap: 6px; flex: none; }
+.top-tools { display: flex; align-items: center; gap: 6px; flex: none; }
+.sync-chip, .fs-btn {
+  appearance: none; height: 34px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface);
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px; cursor: pointer; flex: none;
+  font-size: .78rem; font-weight: 600; white-space: nowrap; transition: background .15s, color .15s, border-color .15s;
+}
+.sync-chip { position: relative; min-width: 34px; padding: 0 8px; color: var(--ink-3); }
+.sync-chip::after { content: ''; position: absolute; top: 4px; inset-inline-end: 4px; width: 7px; height: 7px; border-radius: 50%; background: var(--line-2); box-shadow: 0 0 0 2px var(--surface); }
+.sync-chip.s-on { color: var(--good); }
+.sync-chip.s-on::after { background: var(--good); }
+.sync-chip.s-wait, .sync-chip.s-error { color: var(--bad); }
+.sync-chip.s-wait::after, .sync-chip.s-error::after { background: var(--bad); }
+.sync-chip.s-connecting .ic { animation: syncSpin 1.4s linear infinite; }
+@keyframes syncSpin { to { transform: rotate(360deg); } }
+.sync-lbl { display: none; }
+@media (min-width: 640px) { .sync-lbl { display: inline; } .sync-chip::after { display: none; } }
+.fs-btn { padding: 0 10px; color: var(--ink-2); }
+.fs-btn:hover, .sync-chip:hover { border-color: var(--line-2); }
+.fs-btn[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.fs-ic { display: inline-flex; }
+@media (max-width: 430px) { .topbar-in { gap: 7px; } .top-actions, .top-tools { gap: 4px; } .lvl-chip span { display: none; } .fs-btn { padding: 0 8px; } }
+@media (max-width: 359px) { .fs-lbl { display: none; } .fs-btn { width: 34px; padding: 0; } }
 .icon-btn {
   appearance: none; border: 1px solid transparent; background: transparent; color: var(--ink-2);
   width: 40px; height: 40px; border-radius: 12px; display: inline-grid; place-items: center; cursor: pointer; flex: none;
@@ -1278,7 +1300,7 @@ rect.hm:hover, rect.hm:focus-visible { stroke: var(--ink); stroke-width: 1.5; }
 .set-card .sync-line { display: flex; justify-content: flex-start; align-items: flex-start; gap: 8px; padding: 2px 0 10px; color: var(--ink-2); font-size: .9rem; }
 .set-card .sync-line .ic { margin-top: 3px; }
 .sync-line.s-on .ic { color: var(--good); }
-.sync-line.s-error .ic { color: var(--warn); }
+.sync-line.s-error .ic, .sync-line.s-wait .ic { color: var(--warn); }
 .code-box { width: 100%; min-height: 76px; resize: vertical; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface-2); color: var(--ink); font-family: var(--font-mono); font-size: .8rem; line-height: 1.5; direction: ltr; text-align: left; }
 .code-box::placeholder { color: var(--ink-3); font-family: var(--font-body); direction: rtl; text-align: right; }
 .code-box:focus { outline: 2px solid var(--signal); outline-offset: 1px; }
@@ -1677,12 +1699,22 @@ const Store = (() => {
   // ---------- sync over the artifact db capability (per-viewer private subtree) ----------
   const Sync = (() => {
     let db = null, uid = null, status = 'off', dirtyFlag = false, timer = null, pushing = false, unsub = null, writable = false;
+    let loadTimer = null, firstLoad = true;
+    // what the header chip, the home footer and settings say for each state
+    const LABEL = {
+      on: 'מסונכרן לחשבון Claude שלך: אותה התקדמות בכל המכשירים',
+      connecting: 'מתחבר לחשבון…',
+      wait: 'אין חיבור לחשבון כרגע. ההתקדמות נשמרת במכשיר ותסונכרן כשהחיבור יחזור',
+      error: 'השמירה לחשבון נכשלה. ההתקדמות נשמרת במכשיר בינתיים',
+      off: 'ההתקדמות נשמרת במכשיר הזה בלבד',
+    };
+    const SHORT = { on: 'מסונכרן', connecting: 'מתחבר…', wait: 'לא מחובר', error: 'שמירה נכשלה', off: 'במכשיר בלבד' };
     const docPath = id => `data/users/${uid}/dev_${id}`;
     // codes after which this visit can never sync: a view-only or public-link visitor cannot write
     // their own subtree (rejected as invalid_argument), or access was withdrawn. Progress stays local.
     const FATAL = ['invalid_argument', 'revoked', 'not_granted', 'capability_disabled', 'capability_removed', 'transform_error'];
     function off() {
-      status = 'off'; db = null; clearTimeout(timer);
+      status = 'off'; db = null; clearTimeout(timer); clearTimeout(loadTimer);
       if (unsub) { try { unsub(); } catch (e) { /* ignore */ } unsub = null; }
       emit('sync');
     }
@@ -1705,8 +1737,17 @@ const Store = (() => {
         if (!id) { off(); return; }
         db = dbx; uid = id;
         const col = db.collection(`data/users/${uid}`);
+        // the store may stay silent while it cannot be reached: after 10 s say so instead of "connecting" forever
+        loadTimer = setTimeout(() => { if (status === 'connecting') { status = 'wait'; emit('sync'); } }, 10000);
         unsub = col.onSnapshot(snap => {
           let changed = false;
+          const definitive = !snap.metadata || !snap.metadata.fromCache;
+          if (definitive) {
+            clearTimeout(loadTimer);
+            if (status === 'wait') status = 'connecting';
+            // backup codes restored before sync existed (or while signed out) live only on this device: move them to the account
+            if (firstLoad) { firstLoad = false; const have = new Set(snap.docs.filter(d => d.exists).map(d => d.id)); setTimeout(() => migrateImports(have), 0); }
+          }
           for (const d of snap.docs) {
             if (!d.exists || !d.id.startsWith('dev_')) continue;
             const devId = d.id.slice(4);
@@ -1725,7 +1766,7 @@ const Store = (() => {
           if (writable) status = 'on';
           if (changed) { ls.set(RKEY, remote); mergedCache = null; emit('data'); }
           emit('sync');
-        }, err => { if (err && FATAL.includes(err.code)) off(); else { status = 'error'; emit('sync'); } });
+        }, err => { clearTimeout(loadTimer); if (err && FATAL.includes(err.code)) off(); else { status = 'error'; emit('sync'); } });
         dirtyFlag = true; schedule(800);
       } catch (e) { status = 'error'; emit('sync'); }
     }
@@ -1735,7 +1776,7 @@ const Store = (() => {
       if (!db || !dirtyFlag) return;
       if (pushing) { schedule(1500); return; }
       pushing = true; dirtyFlag = false;
-      try { await db.doc(docPath(deviceId)).set(pack(local)); writable = true; status = 'on'; }
+      try { await db.doc(docPath(deviceId)).set(pack(local)); writable = true; status = 'on'; clearTimeout(loadTimer); }
       catch (e) {
         const code = e && e.code;
         if (FATAL.includes(code)) off();
@@ -1749,6 +1790,12 @@ const Store = (() => {
       if (!db) return;
       try { st.updated = Date.now(); await db.doc(docPath(id)).set(pack(st)); } catch (e) { /* keep local copy */ }
     }
+    async function migrateImports(have) {
+      for (const id of Object.keys(remote)) {
+        if (!db) return;
+        if (id.startsWith('imp') && !have.has('dev_' + id)) await pushImported(id, remote[id]);
+      }
+    }
     async function wipe() {
       if (!db) return;
       try {
@@ -1760,7 +1807,7 @@ const Store = (() => {
         dirtyFlag = true; schedule(500);
       } catch (e) { /* ignore */ }
     }
-    return { init, dirty, flush, pushImported, wipe, status: () => status };
+    return { init, dirty, flush, pushImported, wipe, status: () => status, label: st => LABEL[st || status] || LABEL.off, short: st => SHORT[st || status] || SHORT.off };
   })();
 
   if (typeof window !== 'undefined') {
@@ -2046,6 +2093,8 @@ const UI = (() => {
     back: '<path d="M9 5l7 7-7 7"/>',
     fwd: '<path d="M15 5l-7 7 7 7"/>',
     close: '<path d="M6 6l12 12M18 6L6 18"/>',
+    fs: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+    fsExit: '<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>',
     home: '<path d="M3.5 10.5L12 4l8.5 6.5"/><path d="M5.5 9v10.5h4.5V14h4v5.5h4.5V9"/>',
     chart: '<path d="M4 20V11M9.5 20V5M15 20v-6M20.5 20V9"/><path d="M2.5 20.5h19"/>',
     sliders: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
@@ -2248,7 +2297,8 @@ const App = (() => {
     shell.back = h('button', { type: 'button', class: 'icon-btn top-back', 'aria-label': 'חזרה', title: 'חזרה', onclick: () => { Sound.click(); back(); } }, UI.icon('back', 24));
     shell.title = h('div', { class: 'top-title' });
     shell.actions = h('div', { class: 'top-actions' });
-    shell.top = h('header', { class: 'topbar' }, h('div', { class: 'topbar-in' }, shell.back, shell.title, shell.actions));
+    shell.tools = h('div', { class: 'top-tools' }, syncChip(), fsButton());
+    shell.top = h('header', { class: 'topbar' }, h('div', { class: 'topbar-in' }, shell.back, shell.title, shell.actions, shell.tools));
     shell.view = h('main', { id: 'view', class: 'view', tabindex: '-1' });
     shell.tabs = h('nav', { class: 'tabbar', 'aria-label': 'ניווט ראשי' }, h('div', { class: 'tabbar-in' },
       TABS.map(t => h('button', { type: 'button', class: 'tab', dataset: { tab: t.name }, onclick: () => { Sound.click(); go(t.name, {}, { root: t.name === 'home' ? true : 'tab' }); } }, UI.icon(t.icon, 22), h('span', null, t.label)))));
@@ -2257,6 +2307,59 @@ const App = (() => {
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape' && !document.querySelector('.sheet-wrap')) { back(); }
     });
+  }
+
+  // ---------- header tools, the same on every screen (the header itself is never re-rendered) ----------
+  function syncChip() {
+    const b = h('button', { type: 'button', class: 'sync-chip', onclick: () => UI.toast(Store.Sync.label()) },
+      UI.icon('sync', 16), h('span', { class: 'sync-lbl' }));
+    const paint = () => {
+      const st = Store.Sync.status();
+      b.className = 'sync-chip s-' + st;
+      b.lastChild.textContent = Store.Sync.short(st);
+      b.title = Store.Sync.label(st);
+      b.setAttribute('aria-label', 'מצב השמירה: ' + Store.Sync.label(st));
+    };
+    Store.on(kind => { if (kind === 'sync') paint(); });
+    paint();
+    return b;
+  }
+  const fsEl = () => document.fullscreenElement || document.webkitFullscreenElement || null;
+  function fsButton() {
+    const lbl = h('span', { class: 'fs-lbl' });
+    const ic = h('span', { class: 'fs-ic' });
+    const b = h('button', { type: 'button', class: 'fs-btn' }, ic, lbl);
+    // only the button changes on enter/exit, so timers and progress on screen are never reset
+    const paint = () => {
+      const on = !!fsEl();
+      U.clear(ic).appendChild(UI.icon(on ? 'fsExit' : 'fs', 17));
+      lbl.textContent = on ? 'צא ממסך מלא' : 'מסך מלא';
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      b.setAttribute('aria-label', lbl.textContent);
+      b.title = lbl.textContent;
+    };
+    const refused = () => UI.toast('הדפדפן לא מאפשר מסך מלא בתצוגה הזו');
+    b.addEventListener('click', async () => {
+      Sound.click();
+      const d = document, el = d.documentElement;
+      try {
+        if (fsEl()) {
+          if (d.exitFullscreen) await d.exitFullscreen(); else if (d.webkitExitFullscreen) d.webkitExitFullscreen();
+        } else if (el.requestFullscreen) {
+          await el.requestFullscreen({ navigationUI: 'hide' });
+        } else if (el.webkitRequestFullscreen) {
+          el.webkitRequestFullscreen(); // no promise here: a refusal is silent, so check shortly after
+          setTimeout(() => { if (!fsEl()) refused(); }, 700);
+        } else refused();
+      } catch (e) { refused(); }
+      paint();
+    });
+    document.addEventListener('fullscreenchange', paint);
+    document.addEventListener('webkitfullscreenchange', paint);
+    // opened from the home screen icon, the app already fills the screen
+    try { if (window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true) b.hidden = true; } catch (e) { /* ignore */ }
+    paint();
+    return b;
   }
 
   function setTitle(content) {
@@ -8511,8 +8614,7 @@ const Home = (() => {
   }
   function syncLine() {
     const st = Store.Sync.status();
-    const txt = st === 'on' ? 'מסונכרן בין המכשירים שלך' : st === 'connecting' ? 'מתחבר לסנכרון…' : st === 'error' ? 'הסנכרון לא זמין כרגע, ההתקדמות נשמרת במכשיר' : 'ההתקדמות נשמרת במכשיר הזה';
-    return h('p', { class: 'sync-line s-' + st }, UI.icon('sync', 14), txt);
+    return h('p', { class: 'sync-line s-' + st }, UI.icon('sync', 14), Store.Sync.label(st));
   }
   const totalItems = () => Games.list.reduce((a, t) => a + t.levels, 0);
   function recentAcc(st, days) {
@@ -8577,7 +8679,7 @@ const Settings = (() => {
       toggle('רטט', 'במכשירים שתומכים בכך', 'haptics')));
     // sync + data
     const sync = Store.Sync.status();
-    const syncTxt = sync === 'on' ? 'ההתקדמות מסונכרנת אוטומטית בין כל המכשירים שבהם אתם פותחים את האפליקציה עם אותו חשבון.' : sync === 'connecting' ? 'מתחבר לסנכרון…' : sync === 'error' ? 'הסנכרון לא זמין כרגע. ההתקדמות נשמרת במכשיר, ותסונכרן כשהחיבור יחזור.' : 'ההתקדמות נשמרת במכשיר הזה. כדי להעביר אותה למכשיר אחר, אפשר להשתמש בקוד גיבוי.';
+    const syncTxt = sync === 'on' ? 'ההתקדמות נשמרת בחשבון Claude שלך ומסתנכרנת אוטומטית בין כל המכשירים שבהם אתם נכנסים לאפליקציה עם אותו חשבון.' : sync === 'off' ? 'ההתקדמות נשמרת במכשיר הזה בלבד. כדי לשמור אותה בחשבון, פתחו את האפליקציה מהקישור שלה ב־Claude כשאתם מחוברים. להעברה ידנית אפשר להשתמש בקוד גיבוי.' : Store.Sync.label(sync) + '.';
     const codeOut = h('textarea', { class: 'code-box', id: 'backup-out', readonly: true, rows: 3, 'aria-label': 'קוד גיבוי', hidden: true });
     const codeIn = h('textarea', { class: 'code-box', id: 'backup-in', rows: 3, placeholder: 'הדביקו כאן קוד גיבוי', 'aria-label': 'קוד לשחזור' });
     v.appendChild(h('section', { class: 'card set-card' }, h('h3', null, 'הנתונים שלי'),
